@@ -52,7 +52,7 @@ export var enableLogs = function(debugConfig) {
   if (debugConfig === true || typeof debugConfig === 'object') {
     exportLoggerFunctions(debugConfig,
       // Remove out from list here to hard-disable a log-level
-      //'trace',
+      'trace',
       'debug',
       'log',
       'info',
