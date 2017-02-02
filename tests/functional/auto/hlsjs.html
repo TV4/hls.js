@@ -111,7 +111,7 @@
       </div>
       <script>
         (function() {
-          var methods = ["log", "debug", "info", "warn", "error"];
+          var methods = ["log", "debug", "info", "warn", "error", "trace"];
           methods.forEach(function(methodName) {
             var original = console[methodName];
             if (!original) {

@@ -312,7 +312,7 @@ class AbrController extends EventHandler {
       const bitrate = levels[i].realbitrate ? Math.max(levels[i].realbitrate,levels[i].bitrate) : levels[i].bitrate,
             fetchDuration = bitrate * avgDuration / adjustedbw;
 
-    logger.trace(`level/adjustedbw/bitrate/avgDuration/maxFetchDuration/fetchDuration: ${i}/${Math.round(adjustedbw)}/${bitrate}/${avgDuration}/${maxFetchDuration}/${fetchDuration}`);
+    //logger.trace(`level/adjustedbw/bitrate/avgDuration/maxFetchDuration/fetchDuration: ${i}/${Math.round(adjustedbw)}/${bitrate}/${avgDuration}/${maxFetchDuration}/${fetchDuration}`);
       // if adjusted bw is greater than level bitrate AND
       if (adjustedbw > bitrate &&
       // fragment fetchDuration unknown OR live stream OR fragment fetchDuration less than max allowed fetch duration, then this level matches
