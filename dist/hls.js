@@ -3069,10 +3069,10 @@ function tsdemuxer__classCallCheck(instance, Constructor) { if (!(instance insta
 // With MSE currently one can only have one track of each, and we are muxing
 // whatever video/audio rendition in them.
 var RemuxerTrackIdConfig = {
-  video: 0,
-  audio: 1,
-  id3: 2,
-  text: 3
+  video: 1,
+  audio: 2,
+  id3: 3,
+  text: 4
 };
 
 var tsdemuxer_TSDemuxer = function () {
@@ -15599,6 +15599,29 @@ var calculateOffset = function calculateOffset(vttCCs, cc, presentationTime) {
   vttCCs.presentationOffset = presentationTime;
 };
 
+var ptsNormalize = function ptsNormalize(value, reference) {
+  var offset = void 0;
+  if (reference === undefined) {
+    return value;
+  }
+
+  if (reference < value) {
+    // - 2^33
+    offset = -8589934592;
+  } else {
+    // + 2^33
+    offset = 8589934592;
+  }
+  /* PTS is 33bit (from 0 to 2^33 -1)
+    if diff between value and reference is bigger than half of the amplitude (2^32) then it means that
+    PTS looping occured. fill the gap */
+  while (Math.abs(value - reference) > 4294967296) {
+    value += offset;
+  }
+
+  return value;
+};
+
 var WebVTTParser = {
   parse: function parse(vttByteArray, syncPTS, vttCCs, cc, callBack, errorCallBack) {
     // Convert byteArray into string, replacing any somewhat exotic linefeeds with "\n", then split on that character.
@@ -15635,7 +15658,7 @@ var WebVTTParser = {
 
       if (presentationTime) {
         // If we have MPEGTS, offset = presentation time + discontinuity offset
-        cueOffset = presentationTime + vttCCs.ccOffset - vttCCs.presentationOffset;
+        cueOffset = presentationTime - vttCCs.presentationOffset;
       }
 
       cue.startTime += cueOffset - localTime;
@@ -15681,10 +15704,7 @@ var WebVTTParser = {
           });
           try {
             // Calculate subtitle offset in milliseconds.
-            // If sync PTS is less than zero, we have a 33-bit wraparound, which is fixed by adding 2^33 = 8589934592.
-            syncPTS = syncPTS < 0 ? syncPTS + 8589934592 : syncPTS;
-            // Adjust MPEGTS by sync PTS.
-            mpegTs -= syncPTS;
+            mpegTs = ptsNormalize(mpegTs - syncPTS, vttCCs.ccOffset * 90000);
             // Convert cue time to seconds
             localTime = cueString2millis(cueTime) / 1000;
             // Convert MPEGTS to seconds from 90kHz.
@@ -15753,7 +15773,7 @@ var timeline_controller_TimelineController = function (_EventHandler) {
     _this.textTracks = [];
     _this.tracks = [];
     _this.unparsedVttFrags = [];
-    _this.initPTS = undefined;
+    _this.initPTS = [];
     _this.cueRanges = [];
     _this.captionsTracks = {};
 
@@ -15806,17 +15826,21 @@ var timeline_controller_TimelineController = function (_EventHandler) {
   TimelineController.prototype.onInitPtsFound = function onInitPtsFound(data) {
     var _this2 = this;
 
-    if (typeof this.initPTS === 'undefined') {
-      this.initPTS = data.initPTS;
+    var demuxerId = data.id,
+        cc = data.frag.cc,
+        initPTS = data.initPTS;
+    if (demuxerId === 'main') {
+      this.initPTS[cc] = initPTS;
     }
 
     // Due to asynchrony, initial PTS may arrive later than the first VTT fragments are loaded.
     // Parse any unparsed fragments upon receiving the initial PTS.
     if (this.unparsedVttFrags.length) {
-      this.unparsedVttFrags.forEach(function (frag) {
+      var unparsedVttFrags = this.unparsedVttFrags;
+      this.unparsedVttFrags = [];
+      unparsedVttFrags.forEach(function (frag) {
         _this2.onFragLoaded(frag);
       });
-      this.unparsedVttFrags = [];
     }
   };
 
@@ -15908,7 +15932,7 @@ var timeline_controller_TimelineController = function (_EventHandler) {
 
     this.textTracks = [];
     this.unparsedVttFrags = this.unparsedVttFrags || [];
-    this.initPTS = undefined;
+    this.initPTS = [];
     this.cueRanges = [];
 
     if (this.config.enableWebVTT) {
@@ -15961,7 +15985,7 @@ var timeline_controller_TimelineController = function (_EventHandler) {
     else if (frag.type === 'subtitle') {
         if (payload.byteLength) {
           // We need an initial synchronisation PTS. Store fragments as long as none has arrived.
-          if (typeof this.initPTS === 'undefined') {
+          if (this.initPTS[frag.cc] === undefined) {
             this.unparsedVttFrags.push(data);
             return;
           }
@@ -15988,7 +16012,7 @@ var timeline_controller_TimelineController = function (_EventHandler) {
         hls = this.hls;
 
     // Parse the WebVTT file contents.
-    webvtt_parser.parse(payload, this.initPTS, vttCCs, frag.cc, function (cues) {
+    webvtt_parser.parse(payload, this.initPTS[frag.cc], vttCCs, frag.cc, function (cues) {
       var currentTrack = textTracks[frag.trackId];
       // WebVTTParser.parse is an async method and if the currently selected text track mode is set to "disabled"
       // before parsing is done then don't try to access currentTrack.cues.getCueById as cues will be null
@@ -16025,7 +16049,7 @@ var timeline_controller_TimelineController = function (_EventHandler) {
         frag = data.frag;
 
     if (frag.type === 'subtitle') {
-      if (typeof this.initPTS === 'undefined') {
+      if (this.initPTS[frag.cc] === undefined) {
         this.unparsedVttFrags.push(data);
         return;
       }
@@ -16363,6 +16387,8 @@ function subtitle_stream_controller__inherits(subClass, superClass) { if (typeof
 
 
 
+
+
 var subtitle_stream_controller_State = {
   STOPPED: 'STOPPED',
   IDLE: 'IDLE',
@@ -16376,13 +16402,11 @@ var subtitle_stream_controller_SubtitleStreamController = function (_TaskLoop) {
   function SubtitleStreamController(hls) {
     subtitle_stream_controller__classCallCheck(this, SubtitleStreamController);
 
-    var _this = subtitle_stream_controller__possibleConstructorReturn(this, _TaskLoop.call(this, hls, events["a" /* default */].MEDIA_ATTACHED, events["a" /* default */].ERROR, events["a" /* default */].KEY_LOADED, events["a" /* default */].FRAG_LOADED, events["a" /* default */].SUBTITLE_TRACKS_UPDATED, events["a" /* default */].SUBTITLE_TRACK_SWITCH, events["a" /* default */].SUBTITLE_TRACK_LOADED, events["a" /* default */].SUBTITLE_FRAG_PROCESSED));
+    var _this = subtitle_stream_controller__possibleConstructorReturn(this, _TaskLoop.call(this, hls, events["a" /* default */].MEDIA_ATTACHED, events["a" /* default */].MEDIA_DETACHING, events["a" /* default */].ERROR, events["a" /* default */].KEY_LOADED, events["a" /* default */].FRAG_LOADED, events["a" /* default */].SUBTITLE_TRACKS_UPDATED, events["a" /* default */].SUBTITLE_TRACK_SWITCH, events["a" /* default */].SUBTITLE_TRACK_LOADED, events["a" /* default */].SUBTITLE_FRAG_PROCESSED));
 
     _this.config = hls.config;
-    _this.vttFragSNsProcessed = {};
-    _this.vttFragQueues = undefined;
-    _this.currentlyProcessing = null;
     _this.state = subtitle_stream_controller_State.STOPPED;
+    _this.tracksBuffered = [];
     _this.currentTrackId = -1;
     _this.decrypter = new decrypter["a" /* default */](hls.observer, hls.config);
     return _this;
@@ -16392,45 +16416,51 @@ var subtitle_stream_controller_SubtitleStreamController = function (_TaskLoop) {
     this.state = subtitle_stream_controller_State.STOPPED;
   };
 
-  // Remove all queued items and create a new, empty queue for each track.
-
-
-  SubtitleStreamController.prototype.clearVttFragQueues = function clearVttFragQueues() {
-    var _this2 = this;
-
-    this.vttFragQueues = {};
-    this.tracks.forEach(function (track) {
-      _this2.vttFragQueues[track.id] = [];
-    });
-  };
-
-  // If no frag is being processed and queue isn't empty, initiate processing of next frag in line.
-
-
-  SubtitleStreamController.prototype.nextFrag = function nextFrag() {
-    if (this.currentlyProcessing === null && this.currentTrackId > -1 && this.vttFragQueues[this.currentTrackId].length) {
-      var frag = this.currentlyProcessing = this.vttFragQueues[this.currentTrackId].shift();
-      this.fragCurrent = frag;
-      this.hls.trigger(events["a" /* default */].FRAG_LOADING, { frag: frag });
-      this.state = subtitle_stream_controller_State.FRAG_LOADING;
+  SubtitleStreamController.prototype.getBuffered = function getBuffered() {
+    var buffered = this.tracksBuffered[this.currentTrackId];
+    if (buffered) {
+      return buffered;
     }
+    return [];
   };
-
-  // When fragment has finished processing, add sn to list of completed if successful.
-
 
   SubtitleStreamController.prototype.onSubtitleFragProcessed = function onSubtitleFragProcessed(data) {
+    var buffered = this.tracksBuffered[this.currentTrackId];
+    var frag = data.frag;
     if (data.success) {
-      this.vttFragSNsProcessed[data.frag.trackId].push(data.frag.sn);
-    }
+      this.fragPrevious = frag;
+      if (buffered) {
+        // Create/Update a buffered array matching the interface used by BufferHelper.bufferedInfo
+        // so we can re-use the logic used to detect how much have been buffered
+        var timeRange = void 0;
+        for (var i = 0; i < buffered.length; i++) {
+          if (frag.start >= buffered[i].start && frag.start <= buffered[i].end) {
+            timeRange = buffered[i];
+            break;
+          }
+        }
 
-    this.currentlyProcessing = null;
+        if (timeRange) {
+          timeRange.end = frag.start + frag.duration;
+        } else {
+          buffered.push({
+            start: frag.start,
+            end: frag.start + frag.duration
+          });
+        }
+      }
+    }
     this.state = subtitle_stream_controller_State.IDLE;
-    this.nextFrag();
   };
 
-  SubtitleStreamController.prototype.onMediaAttached = function onMediaAttached() {
+  SubtitleStreamController.prototype.onMediaAttached = function onMediaAttached(data) {
+    this.media = data.media;
     this.state = subtitle_stream_controller_State.IDLE;
+  };
+
+  SubtitleStreamController.prototype.onMediaDetaching = function onMediaDetaching() {
+    this.media = null;
+    this.state = subtitle_stream_controller_State.STOPPED;
   };
 
   // If something goes wrong, procede to next frag, if we were processing one.
@@ -16438,70 +16468,91 @@ var subtitle_stream_controller_SubtitleStreamController = function (_TaskLoop) {
 
   SubtitleStreamController.prototype.onError = function onError(data) {
     var frag = data.frag;
-    // don't handle frag error not related to subtitle fragment
-    if (frag && frag.type !== 'subtitle') {
+    // don't handle error not related to subtitle fragment
+    if (!frag || frag.type !== 'subtitle') {
       return;
     }
-
-    if (this.currentlyProcessing) {
-      this.currentlyProcessing = null;
-      this.nextFrag();
-    }
+    this.state = subtitle_stream_controller_State.IDLE;
   };
 
   SubtitleStreamController.prototype.doTick = function doTick() {
-    var _this3 = this;
-
     switch (this.state) {
       case subtitle_stream_controller_State.IDLE:
         var tracks = this.tracks;
         var trackId = this.currentTrackId;
-
-        var processedFragSNs = this.vttFragSNsProcessed[trackId],
-            fragQueue = this.vttFragQueues[trackId],
-            currentFragSN = this.currentlyProcessing ? this.currentlyProcessing.sn : -1;
-
-        var alreadyProcessed = function alreadyProcessed(frag) {
-          return processedFragSNs.indexOf(frag.sn) > -1;
-        };
-
-        var alreadyInQueue = function alreadyInQueue(frag) {
-          return fragQueue.some(function (fragInQueue) {
-            return fragInQueue.sn === frag.sn;
-          });
-        };
-
-        // exit if tracks don't exist
-        if (!tracks) {
+        if (!tracks || trackId === -1) {
           break;
         }
-
-        var trackDetails;
-
+        var trackDetails = void 0;
         if (trackId < tracks.length) {
           trackDetails = tracks[trackId].details;
         }
-
-        if (typeof trackDetails === 'undefined') {
+        if (!trackDetails) {
+          break;
+        }
+        if (!this.media) {
           break;
         }
 
-        // Add all fragments that haven't been, aren't currently being and aren't waiting to be processed, to queue.
-        trackDetails.fragments.forEach(function (frag) {
-          if (!(alreadyProcessed(frag) || frag.sn === currentFragSN || alreadyInQueue(frag))) {
-            // Load key if subtitles are encrypted
-            if (frag.decryptdata && frag.decryptdata.uri != null && frag.decryptdata.key == null) {
-              logger["b" /* logger */].log('Loading key for ' + frag.sn);
-              _this3.state = subtitle_stream_controller_State.KEY_LOADING;
-              _this3.hls.trigger(events["a" /* default */].KEY_LOADING, { frag: frag });
-            } else {
-              // Frags don't know their subtitle track ID, so let's just add that...
-              frag.trackId = trackId;
-              fragQueue.push(frag);
-              _this3.nextFrag();
+        var config = this.config;
+        var maxBufferHole = config.maxBufferHole;
+        var maxConfigBuffer = Math.min(config.maxBufferLength, config.maxMaxBufferLength);
+        var maxFragLookUpTolerance = config.maxFragLookUpTolerance;
+
+        var bufferedInfo = BufferHelper.bufferedInfo(this.getBuffered(), this.media.currentTime, maxBufferHole);
+        var bufferEnd = bufferedInfo.end;
+        var bufferLen = bufferedInfo.len;
+
+        var fragments = trackDetails.fragments;
+        var fragLen = fragments.length;
+        var end = fragments[fragLen - 1].start + fragments[fragLen - 1].duration;
+
+        if (bufferLen < maxConfigBuffer && bufferEnd < end) {
+          var fragNext = this.fragPrevious ? fragments[this.fragPrevious.sn - fragments[0].sn + 1] : undefined;
+
+          var fragmentWithinToleranceTest = function fragmentWithinToleranceTest(candidate) {
+            // offset should be within fragment boundary - maxFragLookUpTolerance
+            // this is to cope with situations like
+            // bufferEnd = 9.991
+            // frag[Ø] : [0,10]
+            // frag[1] : [10,20]
+            // bufferEnd is within frag[0] range ... although what we are expecting is to return frag[1] here
+            //              frag start               frag start+duration
+            //                  |-----------------------------|
+            //              <--->                         <--->
+            //  ...--------><-----------------------------><---------....
+            // previous frag         matching fragment         next frag
+            //  return -1             return 0                 return 1
+            // logger.log(`level/sn/start/end/bufEnd:${level}/${candidate.sn}/${candidate.start}/${(candidate.start+candidate.duration)}/${bufferEnd}`);
+            // Set the lookup tolerance to be small enough to detect the current segment - ensures we don't skip over very small segments
+            var candidateLookupTolerance = Math.min(maxFragLookUpTolerance, candidate.duration);
+            if (candidate.start + candidate.duration - candidateLookupTolerance <= bufferEnd) {
+              return 1;
+            } else if (candidate.start - candidateLookupTolerance > bufferEnd && candidate.start) {
+              // if maxFragLookUpTolerance will have negative value then don't return -1 for first element
+              return -1;
             }
+            return 0;
+          };
+
+          var foundFrag = void 0;
+          if (fragNext && !fragmentWithinToleranceTest(fragNext)) {
+            foundFrag = fragNext;
+          } else {
+            foundFrag = binary_search.search(fragments, fragmentWithinToleranceTest);
           }
-        });
+
+          if (foundFrag && foundFrag.decryptdata && foundFrag.decryptdata.uri != null && foundFrag.decryptdata.key == null) {
+            logger["b" /* logger */].log('Loading key for ' + foundFrag.sn);
+            this.state = subtitle_stream_controller_State.KEY_LOADING;
+            this.hls.trigger(events["a" /* default */].KEY_LOADING, { frag: foundFrag });
+          } else if (foundFrag) {
+            foundFrag.trackId = trackId; // Frags don't know their subtitle track ID, so let's just add that...
+            this.fragCurrent = foundFrag;
+            this.state = subtitle_stream_controller_State.FRAG_LOADING;
+            this.hls.trigger(events["a" /* default */].FRAG_LOADING, { frag: foundFrag });
+          }
+        }
     }
   };
 
@@ -16509,29 +16560,28 @@ var subtitle_stream_controller_SubtitleStreamController = function (_TaskLoop) {
 
 
   SubtitleStreamController.prototype.onSubtitleTracksUpdated = function onSubtitleTracksUpdated(data) {
-    var _this4 = this;
+    var _this2 = this;
 
     logger["b" /* logger */].log('subtitle tracks updated');
+    this.tracksBuffered = [];
     this.tracks = data.subtitleTracks;
-    this.clearVttFragQueues();
-    this.vttFragSNsProcessed = {};
     this.tracks.forEach(function (track) {
-      _this4.vttFragSNsProcessed[track.id] = [];
+      _this2.tracksBuffered[track.id] = [];
     });
   };
 
   SubtitleStreamController.prototype.onSubtitleTrackSwitch = function onSubtitleTrackSwitch(data) {
     this.currentTrackId = data.id;
     if (this.currentTrackId === -1) {
+      this.clearInterval();
       return;
     }
 
-    // Check if track was already loaded and if so make sure we finish
-    // downloading its frags, if not all have been downloaded yet
+    // Check if track has the necessary details to load fragments
     var currentTrack = this.tracks[this.currentTrackId];
     var details = currentTrack.details;
     if (details !== undefined) {
-      this.tick();
+      this.setInterval(500);
     }
   };
 
@@ -16539,13 +16589,12 @@ var subtitle_stream_controller_SubtitleStreamController = function (_TaskLoop) {
 
 
   SubtitleStreamController.prototype.onSubtitleTrackLoaded = function onSubtitleTrackLoaded() {
-    this.tick();
+    this.setInterval(500);
   };
 
   SubtitleStreamController.prototype.onKeyLoaded = function onKeyLoaded() {
     if (this.state === subtitle_stream_controller_State.KEY_LOADING) {
       this.state = subtitle_stream_controller_State.IDLE;
-      this.tick();
     }
   };
 

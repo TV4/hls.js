@@ -3061,10 +3061,10 @@ function tsdemuxer__classCallCheck(instance, Constructor) { if (!(instance insta
 // With MSE currently one can only have one track of each, and we are muxing
 // whatever video/audio rendition in them.
 var RemuxerTrackIdConfig = {
-  video: 0,
-  audio: 1,
-  id3: 2,
-  text: 3
+  video: 1,
+  audio: 2,
+  id3: 3,
+  text: 4
 };
 
 var tsdemuxer_TSDemuxer = function () {
