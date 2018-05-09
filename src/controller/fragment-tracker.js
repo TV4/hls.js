@@ -233,7 +233,8 @@ export class FragmentTracker extends EventHandler {
   onFragLoaded (e) {
     let fragment = e.frag;
     // dont track initsegment (for which sn is not a number)
-    if (!isNaN(fragment.sn)) {
+    // dont track frags used for bitrateTest, they're irrelevant
+    if (!isNaN(fragment.sn) && !fragment.bitrateTest) {
       let fragKey = this.getFragmentKey(fragment);
       let fragmentEntity = {
         body: fragment,
