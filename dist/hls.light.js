@@ -6089,6 +6089,11 @@ var fragment_Fragment = function () {
 
       return this._decryptdata;
     }
+  }, {
+    key: 'encrypted',
+    get: function get() {
+      return !!(this.decryptdata && this.decryptdata.uri !== null && this.decryptdata.key === null);
+    }
   }], [{
     key: 'ElementaryStreamTypes',
     get: function get() {
@@ -7690,7 +7695,8 @@ var fragment_tracker_FragmentTracker = function (_EventHandler) {
   FragmentTracker.prototype.onFragLoaded = function onFragLoaded(e) {
     var fragment = e.frag;
     // dont track initsegment (for which sn is not a number)
-    if (!isNaN(fragment.sn)) {
+    // dont track frags used for bitrateTest, they're irrelevant
+    if (!isNaN(fragment.sn) && !fragment.bitrateTest) {
       var fragKey = this.getFragmentKey(fragment);
       var fragmentEntity = {
         body: fragment,
@@ -8874,7 +8880,13 @@ var stream_controller_StreamController = function (_TaskLoop) {
     }
 
     if (frag) {
-      this._loadFragmentOrKey(frag, level, levelDetails, pos, bufferEnd);
+      if (frag.encrypted) {
+        logger["b" /* logger */].log('Loading key for ' + frag.sn + ' of [' + levelDetails.startSN + ' ,' + levelDetails.endSN + '],level ' + level);
+        this._loadKey(frag);
+      } else {
+        logger["b" /* logger */].log('Loading ' + frag.sn + ' of [' + levelDetails.startSN + ' ,' + levelDetails.endSN + '],level ' + level + ', currentTime:' + pos.toFixed(3) + ',bufferEnd:' + bufferEnd.toFixed(3));
+        this._loadFragment(frag);
+      }
     }
   };
 
@@ -9095,41 +9107,38 @@ var stream_controller_StreamController = function (_TaskLoop) {
     return frag;
   };
 
-  StreamController.prototype._loadFragmentOrKey = function _loadFragmentOrKey(frag, level, levelDetails, pos, bufferEnd) {
-    // logger.log('loading frag ' + i +',pos/bufEnd:' + pos.toFixed(3) + '/' + bufferEnd.toFixed(3));
-    if (frag.decryptdata && frag.decryptdata.uri != null && frag.decryptdata.key == null) {
-      logger["b" /* logger */].log('Loading key for ' + frag.sn + ' of [' + levelDetails.startSN + ' ,' + levelDetails.endSN + '],level ' + level);
-      this.state = State.KEY_LOADING;
-      this.hls.trigger(events["a" /* default */].KEY_LOADING, { frag: frag });
-    } else {
-      logger["b" /* logger */].log('Loading ' + frag.sn + ' of [' + levelDetails.startSN + ' ,' + levelDetails.endSN + '],level ' + level + ', currentTime:' + pos.toFixed(3) + ',bufferEnd:' + bufferEnd.toFixed(3));
-      // Check if fragment is not loaded
-      var fragState = this.fragmentTracker.getState(frag);
+  StreamController.prototype._loadKey = function _loadKey(frag) {
+    this.state = State.KEY_LOADING;
+    this.hls.trigger(events["a" /* default */].KEY_LOADING, { frag: frag });
+  };
 
-      this.fragCurrent = frag;
-      this.startFragRequested = true;
-      // Don't update nextLoadPosition for fragments which are not buffered
-      if (!isNaN(frag.sn) && !frag.bitrateTest) {
-        this.nextLoadPosition = frag.start + frag.duration;
+  StreamController.prototype._loadFragment = function _loadFragment(frag) {
+    // Check if fragment is not loaded
+    var fragState = this.fragmentTracker.getState(frag);
+
+    this.fragCurrent = frag;
+    this.startFragRequested = true;
+    // Don't update nextLoadPosition for fragments which are not buffered
+    if (!isNaN(frag.sn) && !frag.bitrateTest) {
+      this.nextLoadPosition = frag.start + frag.duration;
+    }
+
+    // Allow backtracked fragments to load
+    if (frag.backtracked || fragState === FragmentState.NOT_LOADED || fragState === FragmentState.PARTIAL) {
+      frag.autoLevel = this.hls.autoLevelEnabled;
+      frag.bitrateTest = this.bitrateTest;
+
+      this.hls.trigger(events["a" /* default */].FRAG_LOADING, { frag: frag });
+      // lazy demuxer init, as this could take some time ... do it during frag loading
+      if (!this.demuxer) {
+        this.demuxer = new demux_demuxer(this.hls, 'main');
       }
 
-      // Allow backtracked fragments to load
-      if (frag.backtracked || fragState === FragmentState.NOT_LOADED) {
-        frag.autoLevel = this.hls.autoLevelEnabled;
-        frag.bitrateTest = this.bitrateTest;
-
-        this.hls.trigger(events["a" /* default */].FRAG_LOADING, { frag: frag });
-        // lazy demuxer init, as this could take some time ... do it during frag loading
-        if (!this.demuxer) {
-          this.demuxer = new demux_demuxer(this.hls, 'main');
-        }
-
-        this.state = State.FRAG_LOADING;
-      } else if (fragState === FragmentState.APPENDING) {
-        // Lower the buffer size and try again
-        if (this._reduceMaxBufferLength(frag.duration)) {
-          this.fragmentTracker.removeFragment(frag);
-        }
+      this.state = State.FRAG_LOADING;
+    } else if (fragState === FragmentState.APPENDING) {
+      // Lower the buffer size and try again
+      if (this._reduceMaxBufferLength(frag.duration)) {
+        this.fragmentTracker.removeFragment(frag);
       }
     }
   };
@@ -9707,9 +9716,9 @@ var stream_controller_StreamController = function (_TaskLoop) {
           if (!frag.backtracked) {
             var levelDetails = level.details;
             if (levelDetails && frag.sn === levelDetails.startSN) {
-              logger["b" /* logger */].warn('missing video frame(s) on first frag, appending with gap');
+              logger["b" /* logger */].warn('missing video frame(s) on first frag, appending with gap', frag.sn);
             } else {
-              logger["b" /* logger */].warn('missing video frame(s), backtracking fragment');
+              logger["b" /* logger */].warn('missing video frame(s), backtracking fragment', frag.sn);
               // Return back to the IDLE state without appending to buffer
               // Causes findFragments to backtrack a segment and find the keyframe
               // Audio fragments arriving before video sets the nextLoadPosition, causing _findFragments to skip the backtracked fragment
@@ -9722,7 +9731,7 @@ var stream_controller_StreamController = function (_TaskLoop) {
               return;
             }
           } else {
-            logger["b" /* logger */].warn('Already backtracked on this fragment, appending with the gap');
+            logger["b" /* logger */].warn('Already backtracked on this fragment, appending with the gap', frag.sn);
           }
         } else {
           // Only reset the backtracked flag if we've loaded the frag without any dropped frames
@@ -11002,6 +11011,7 @@ var abr_controller_AbrController = function (_EventHandler) {
     var frag = data.frag;
     if (frag.type === 'main') {
       if (!this.timer) {
+        this.fragCurrent = frag;
         this.timer = setInterval(this.onCheck, 100);
       }
 
@@ -11024,7 +11034,6 @@ var abr_controller_AbrController = function (_EventHandler) {
         }
         this._bwEstimator = new ewma_bandwidth_estimator(hls, ewmaSlow, ewmaFast, config.abrEwmaDefaultEstimate);
       }
-      this.fragCurrent = frag;
     }
   };
 
@@ -11034,11 +11043,11 @@ var abr_controller_AbrController = function (_EventHandler) {
       we compute expected time of arrival of the complete fragment.
       we compare it to expected time of buffer starvation
     */
-    var hls = this.hls,
-        v = hls.media,
-        frag = this.fragCurrent,
-        loader = frag.loader,
-        minAutoLevel = hls.minAutoLevel;
+    var hls = this.hls;
+    var v = hls.media;
+    var frag = this.fragCurrent;
+    var minAutoLevel = hls.minAutoLevel;
+    var loader = frag.loader;
 
     // if loader has been destroyed or loading has been aborted, stop timer and return
     if (!loader || loader.stats && loader.stats.aborted) {
