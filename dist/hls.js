@@ -8641,11 +8641,13 @@ var stream_controller_StreamController = function (_TaskLoop) {
 
   StreamController.prototype.onHandlerDestroying = function onHandlerDestroying() {
     this.stopLoad();
+    _TaskLoop.prototype.onHandlerDestroying.call(this);
   };
 
   StreamController.prototype.onHandlerDestroyed = function onHandlerDestroyed() {
     this.state = State.STOPPED;
     this.fragmentTracker = null;
+    _TaskLoop.prototype.onHandlerDestroyed.call(this);
   };
 
   StreamController.prototype.startLoad = function startLoad(startPosition) {
@@ -12614,11 +12616,13 @@ var audio_stream_controller_AudioStreamController = function (_TaskLoop) {
 
   AudioStreamController.prototype.onHandlerDestroying = function onHandlerDestroying() {
     this.stopLoad();
+    _TaskLoop.prototype.onHandlerDestroying.call(this);
   };
 
   AudioStreamController.prototype.onHandlerDestroyed = function onHandlerDestroyed() {
     this.state = audio_stream_controller_State.STOPPED;
     this.fragmentTracker = null;
+    _TaskLoop.prototype.onHandlerDestroyed.call(this);
   };
 
   // Signal that video PTS was found

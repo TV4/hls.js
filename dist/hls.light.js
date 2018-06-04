@@ -8631,11 +8631,13 @@ var stream_controller_StreamController = function (_TaskLoop) {
 
   StreamController.prototype.onHandlerDestroying = function onHandlerDestroying() {
     this.stopLoad();
+    _TaskLoop.prototype.onHandlerDestroying.call(this);
   };
 
   StreamController.prototype.onHandlerDestroyed = function onHandlerDestroyed() {
     this.state = State.STOPPED;
     this.fragmentTracker = null;
+    _TaskLoop.prototype.onHandlerDestroyed.call(this);
   };
 
   StreamController.prototype.startLoad = function startLoad(startPosition) {
