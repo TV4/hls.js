@@ -7,7 +7,8 @@ import { logger } from '../utils/logger';
 import Decrypter from '../crypt/decrypter';
 import TaskLoop from '../task-loop';
 import { BufferHelper } from '../utils/buffer-helper';
-import BinarySearch from '../utils/binary-search';
+import { findFragmentBySN } from './fragment-finders';
+import { FragmentState } from './fragment-tracker';
 
 const State = {
   STOPPED: 'STOPPED',
@@ -16,8 +17,10 @@ const State = {
   FRAG_LOADING: 'FRAG_LOADING'
 };
 
+const TICK_INTERVAL = 500; // how often to tick in ms
+
 class SubtitleStreamController extends TaskLoop {
-  constructor (hls) {
+  constructor (hls, fragmentTracker) {
     super(hls,
       Event.MEDIA_ATTACHED,
       Event.MEDIA_DETACHING,
@@ -29,6 +32,7 @@ class SubtitleStreamController extends TaskLoop {
       Event.SUBTITLE_TRACK_LOADED,
       Event.SUBTITLE_FRAG_PROCESSED);
 
+    this.fragmentTracker = fragmentTracker;
     this.config = hls.config;
     this.state = State.STOPPED;
     this.tracksBuffered = [];
@@ -37,7 +41,9 @@ class SubtitleStreamController extends TaskLoop {
   }
 
   onHandlerDestroyed () {
+    this.fragmentTracker = null;
     this.state = State.STOPPED;
+    super.onHandlerDestroyed();
   }
 
   getBuffered () {
@@ -130,45 +136,13 @@ class SubtitleStreamController extends TaskLoop {
       const end = fragments[fragLen - 1].start + fragments[fragLen - 1].duration;
 
       if (bufferLen < maxConfigBuffer && bufferEnd < end) {
-        const fragNext = this.fragPrevious ? fragments[this.fragPrevious.sn - fragments[0].sn + 1] : undefined;
-
-        let fragmentWithinToleranceTest = (candidate) => {
-          // offset should be within fragment boundary - maxFragLookUpTolerance
-          // this is to cope with situations like
-          // bufferEnd = 9.991
-          // frag[Ø] : [0,10]
-          // frag[1] : [10,20]
-          // bufferEnd is within frag[0] range ... although what we are expecting is to return frag[1] here
-          //              frag start               frag start+duration
-          //                  |-----------------------------|
-          //              <--->                         <--->
-          //  ...--------><-----------------------------><---------....
-          // previous frag         matching fragment         next frag
-          //  return -1             return 0                 return 1
-          // logger.log(`level/sn/start/end/bufEnd:${level}/${candidate.sn}/${candidate.start}/${(candidate.start+candidate.duration)}/${bufferEnd}`);
-          // Set the lookup tolerance to be small enough to detect the current segment - ensures we don't skip over very small segments
-          let candidateLookupTolerance = Math.min(maxFragLookUpTolerance, candidate.duration);
-          if ((candidate.start + candidate.duration - candidateLookupTolerance) <= bufferEnd) {
-            return 1;
-          } else if (candidate.start - candidateLookupTolerance > bufferEnd && candidate.start) {
-            // if maxFragLookUpTolerance will have negative value then don't return -1 for first element
-            return -1;
-          }
-          return 0;
-        };
-
-        let foundFrag;
-        if (fragNext && !fragmentWithinToleranceTest(fragNext)) {
-          foundFrag = fragNext;
-        } else {
-          foundFrag = BinarySearch.search(fragments, fragmentWithinToleranceTest);
-        }
-
+        const foundFrag = findFragmentBySN(this.fragPrevious, fragments, bufferEnd, end, maxFragLookUpTolerance);
         if (foundFrag && foundFrag.encrypted) {
           logger.log(`Loading key for ${foundFrag.sn}`);
           this.state = State.KEY_LOADING;
           this.hls.trigger(Event.KEY_LOADING, { frag: foundFrag });
-        } else if (foundFrag) {
+        } else if (foundFrag && this.fragmentTracker.getState(foundFrag) === FragmentState.NOT_LOADED) {
+          // only load if fragment is not loaded
           foundFrag.trackId = trackId; // Frags don't know their subtitle track ID, so let's just add that...
           this.fragCurrent = foundFrag;
           this.state = State.FRAG_LOADING;
@@ -190,22 +164,21 @@ class SubtitleStreamController extends TaskLoop {
 
   onSubtitleTrackSwitch (data) {
     this.currentTrackId = data.id;
-    if (this.currentTrackId === -1) {
+    if (!this.tracks || this.currentTrackId === -1) {
       this.clearInterval();
       return;
     }
 
     // Check if track has the necessary details to load fragments
     const currentTrack = this.tracks[this.currentTrackId];
-    let details = currentTrack.details;
-    if (details !== undefined) {
-      this.setInterval(500);
+    if (currentTrack && currentTrack.details) {
+      this.setInterval(TICK_INTERVAL);
     }
   }
 
   // Got a new set of subtitle fragments.
   onSubtitleTrackLoaded () {
-    this.setInterval(500);
+    this.setInterval(TICK_INTERVAL);
   }
 
   onKeyLoaded () {
