@@ -12545,7 +12545,7 @@ var hls_Hls = function () {
      * @type {string}
      */
     get: function get() {
-      return "0.9.1";
+      return "0.9.1-tv4-0.1";
     }
   }, {
     key: 'Events',
