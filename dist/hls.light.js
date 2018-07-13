@@ -6439,7 +6439,7 @@ var m3u8_parser_M3U8Parser = function () {
     return medias;
   };
 
-  M3U8Parser.parseLevelPlaylist = function parseLevelPlaylist(string, baseurl, id, type) {
+  M3U8Parser.parseLevelPlaylist = function parseLevelPlaylist(string, baseurl, id, type, levelUrlId) {
     var currentSN = 0,
         totalduration = 0,
         level = { type: null, version: null, url: baseurl, fragments: [], live: true, startSN: 0 },
@@ -6471,6 +6471,7 @@ var m3u8_parser_M3U8Parser = function () {
           frag.sn = sn;
           frag.level = id;
           frag.cc = cc;
+          frag.urlId = levelUrlId;
           frag.baseurl = baseurl;
           // avoid sliced strings    https://github.com/video-dev/hls.js/issues/939
           frag.relurl = (' ' + result[3]).slice(1);
@@ -7002,10 +7003,11 @@ var playlist_loader_PlaylistLoader = function (_EventHandler) {
 
     var url = PlaylistLoader.getResponseUrl(response, context);
 
-    var levelId = !isNaN(level) ? level : !isNaN(id) ? id : 0; // level -> id -> 0
+    var levelUrlId = isNaN(id) ? 0 : id;
+    var levelId = isNaN(level) ? levelUrlId : level; // level -> id -> 0
     var levelType = PlaylistLoader.mapContextToLevelType(context);
 
-    var levelDetails = m3u8_parser.parseLevelPlaylist(response.data, url, levelId, levelType);
+    var levelDetails = m3u8_parser.parseLevelPlaylist(response.data, url, levelId, levelType, levelUrlId);
 
     // set stats on level structure
     levelDetails.tload = stats.tload;
@@ -7287,24 +7289,26 @@ var fragment_loader_FragmentLoader = function (_EventHandler) {
   FragmentLoader.prototype.loaderror = function loaderror(response, context) {
     var networkDetails = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : null;
 
-    var loader = context.loader;
+    var frag = context.frag;
+    var loader = frag.loader;
     if (loader) {
       loader.abort();
     }
 
-    this.loaders[context.type] = undefined;
+    this.loaders[frag.type] = undefined;
     this.hls.trigger(events["a" /* default */].ERROR, { type: errors["b" /* ErrorTypes */].NETWORK_ERROR, details: errors["a" /* ErrorDetails */].FRAG_LOAD_ERROR, fatal: false, frag: context.frag, response: response, networkDetails: networkDetails });
   };
 
   FragmentLoader.prototype.loadtimeout = function loadtimeout(stats, context) {
     var networkDetails = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : null;
 
-    var loader = context.loader;
+    var frag = context.frag;
+    var loader = frag.loader;
     if (loader) {
       loader.abort();
     }
 
-    this.loaders[context.type] = undefined;
+    this.loaders[frag.type] = undefined;
     this.hls.trigger(events["a" /* default */].ERROR, { type: errors["b" /* ErrorTypes */].NETWORK_ERROR, details: errors["a" /* ErrorDetails */].FRAG_LOAD_TIMEOUT, fatal: false, frag: context.frag, networkDetails: networkDetails });
   };
 
@@ -7604,7 +7608,7 @@ var fragment_tracker_FragmentTracker = function (_EventHandler) {
   };
 
   FragmentTracker.prototype.getFragmentKey = function getFragmentKey(fragment) {
-    return fragment.type + '_' + fragment.level + '_' + fragment.sn;
+    return fragment.type + '_' + fragment.level + '_' + fragment.urlId + '_' + fragment.sn;
   };
 
   /**
@@ -7694,8 +7698,8 @@ var fragment_tracker_FragmentTracker = function (_EventHandler) {
 
   FragmentTracker.prototype.onFragLoaded = function onFragLoaded(e) {
     var fragment = e.frag;
-    // dont track initsegment (for which sn is not a number)
-    // dont track frags used for bitrateTest, they're irrelevant
+    // don't track initsegment (for which sn is not a number)
+    // don't track frags used for bitrateTest, they're irrelevant.
     if (!isNaN(fragment.sn) && !fragment.bitrateTest) {
       var fragKey = this.getFragmentKey(fragment);
       var fragmentEntity = {
@@ -8572,6 +8576,136 @@ var TaskLoop = function (_EventHandler) {
 }(event_handler);
 
 /* harmony default export */ var task_loop = (TaskLoop);
+// CONCATENATED MODULE: ./src/controller/fragment-finders.js
+
+
+/**
+ * Calculates the PDT of the next load position.
+ * bufferEnd in this function is usually the position of the playhead.
+ * @param {number} [start = 0] - The PTS of the first fragment within the level
+ * @param {number} [bufferEnd = 0] - The end of the contiguous buffered range the playhead is currently within
+ * @param {*} levelDetails - An object containing the parsed and computed properties of the currently playing level
+ * @returns {number} nextPdt - The computed PDT
+ */
+function calculateNextPDT() {
+  var start = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 0;
+  var bufferEnd = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
+  var levelDetails = arguments[2];
+
+  var pdt = 0;
+  if (levelDetails.programDateTime) {
+    var parsedDateInt = Date.parse(levelDetails.programDateTime);
+    if (!isNaN(parsedDateInt)) {
+      pdt = bufferEnd * 1000 + parsedDateInt - 1000 * start;
+    }
+  }
+  return pdt;
+}
+
+/**
+ * Finds the first fragment whose endPDT value exceeds the given PDT.
+ * @param {Array<Fragment>} fragments - The array of candidate fragments
+ * @param {number|null} [PDTValue = null] - The PDT value which must be exceeded
+ * @returns {*|null} fragment - The best matching fragment
+ */
+function findFragmentByPDT(fragments) {
+  var PDTValue = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : null;
+
+  if (!Array.isArray(fragments) || !fragments.length || PDTValue === null) {
+    return null;
+  }
+
+  // if less than start
+  var firstSegment = fragments[0];
+
+  if (PDTValue < firstSegment.pdt) {
+    return null;
+  }
+
+  var lastSegment = fragments[fragments.length - 1];
+
+  if (PDTValue >= lastSegment.endPdt) {
+    return null;
+  }
+
+  for (var seg = 0; seg < fragments.length; ++seg) {
+    var frag = fragments[seg];
+    if (PDTValue < frag.endPdt) {
+      return frag;
+    }
+  }
+  return null;
+}
+
+/**
+ * Finds a fragment based on the SN of the previous fragment; or based on the needs of the current buffer.
+ * This method compensates for small buffer gaps by applying a tolerance to the start of any candidate fragment, thus
+ * breaking any traps which would cause the same fragment to be continuously selected within a small range.
+ * @param {*} fragPrevious - The last frag successfully appended
+ * @param {Array<Fragment>} fragments - The array of candidate fragments
+ * @param {number} [bufferEnd = 0] - The end of the contiguous buffered range the playhead is currently within
+ * @param {number} [end = 0] - The computed end time of the stream
+ * @param {number} maxFragLookUpTolerance - The amount of time that a fragment's start can be within in order to be considered contiguous
+ * @returns {*} foundFrag - The best matching fragment
+ */
+function findFragmentBySN(fragPrevious, fragments) {
+  var bufferEnd = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 0;
+  var end = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : 0;
+  var maxFragLookUpTolerance = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : 0;
+
+  var foundFrag = void 0;
+  var fragNext = fragPrevious ? fragments[fragPrevious.sn - fragments[0].sn + 1] : null;
+  if (bufferEnd < end) {
+    if (bufferEnd > end - maxFragLookUpTolerance) {
+      maxFragLookUpTolerance = 0;
+    }
+
+    // Prefer the next fragment if it's within tolerance
+    if (fragNext && !fragmentWithinToleranceTest(bufferEnd, maxFragLookUpTolerance, fragNext)) {
+      foundFrag = fragNext;
+    } else {
+      foundFrag = binary_search.search(fragments, fragmentWithinToleranceTest.bind(null, bufferEnd, maxFragLookUpTolerance));
+    }
+  }
+  return foundFrag;
+}
+
+/**
+ * The test function used by the findFragmentBySn's BinarySearch to look for the best match to the current buffer conditions.
+ * @param {*} candidate - The fragment to test
+ * @param {number} [bufferEnd = 0] - The end of the current buffered range the playhead is currently within
+ * @param {number} [maxFragLookUpTolerance = 0] - The amount of time that a fragment's start can be within in order to be considered contiguous
+ * @returns {number} - 0 if it matches, 1 if too low, -1 if too high
+ */
+function fragmentWithinToleranceTest() {
+  var bufferEnd = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 0;
+  var maxFragLookUpTolerance = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
+  var candidate = arguments[2];
+
+  // offset should be within fragment boundary - config.maxFragLookUpTolerance
+  // this is to cope with situations like
+  // bufferEnd = 9.991
+  // frag[Ø] : [0,10]
+  // frag[1] : [10,20]
+  // bufferEnd is within frag[0] range ... although what we are expecting is to return frag[1] here
+  //              frag start               frag start+duration
+  //                  |-----------------------------|
+  //              <--->                         <--->
+  //  ...--------><-----------------------------><---------....
+  // previous frag         matching fragment         next frag
+  //  return -1             return 0                 return 1
+  // logger.log(`level/sn/start/end/bufEnd:${level}/${candidate.sn}/${candidate.start}/${(candidate.start+candidate.duration)}/${bufferEnd}`);
+  // Set the lookup tolerance to be small enough to detect the current segment - ensures we don't skip over very small segments
+  var candidateLookupTolerance = Math.min(maxFragLookUpTolerance, candidate.duration + (candidate.deltaPTS ? candidate.deltaPTS : 0));
+  if (candidate.start + candidate.duration - candidateLookupTolerance <= bufferEnd) {
+    return 1;
+  } else if (candidate.start - candidateLookupTolerance > bufferEnd && candidate.start) {
+    // if maxFragLookUpTolerance will have negative value then don't return -1 for first element
+    return -1;
+  }
+
+  return 0;
+}
 // CONCATENATED MODULE: ./src/controller/stream-controller.js
 var stream_controller__createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
 
@@ -8584,6 +8718,7 @@ function stream_controller__inherits(subClass, superClass) { if (typeof superCla
 /*
  * Stream Controller
 */
+
 
 
 
@@ -8612,6 +8747,8 @@ var State = {
   ENDED: 'ENDED',
   ERROR: 'ERROR'
 };
+
+var TICK_INTERVAL = 100; // how often to tick in ms
 
 var stream_controller_StreamController = function (_TaskLoop) {
   stream_controller__inherits(StreamController, _TaskLoop);
@@ -8645,7 +8782,7 @@ var stream_controller_StreamController = function (_TaskLoop) {
       var lastCurrentTime = this.lastCurrentTime,
           hls = this.hls;
       this.stopLoad();
-      this.setInterval(100);
+      this.setInterval(TICK_INTERVAL);
       this.level = -1;
       this.fragLoadError = 0;
       if (!this.startFragRequested) {
@@ -8955,7 +9092,7 @@ var stream_controller_StreamController = function (_TaskLoop) {
           }
         } else {
           // Relies on PDT in order to switch bitrates (Support EXT-X-DISCONTINUITY without EXT-X-DISCONTINUITY-SEQUENCE)
-          frag = this._findFragmentByPDT(fragments, fragPrevious.endPdt + 1);
+          frag = findFragmentByPDT(fragments, fragPrevious.endPdt + 1);
         }
       }
       if (!frag) {
@@ -8969,92 +9106,27 @@ var stream_controller_StreamController = function (_TaskLoop) {
     return frag;
   };
 
-  StreamController.prototype._findFragmentByPDT = function _findFragmentByPDT(fragments, PDTValue) {
-    if (!fragments || PDTValue === undefined) {
-      return null;
-    }
-
-    // if less than start
-    var firstSegment = fragments[0];
-
-    if (PDTValue < firstSegment.pdt) {
-      return null;
-    }
-
-    var lastSegment = fragments[fragments.length - 1];
-
-    if (PDTValue >= lastSegment.endPdt) {
-      return null;
-    }
-
-    for (var seg = 0; seg < fragments.length; ++seg) {
-      var frag = fragments[seg];
-      if (PDTValue < frag.endPdt) {
-        return frag;
-      }
-    }
-    return null;
-  };
-
-  StreamController.prototype._findFragmentBySN = function _findFragmentBySN(fragPrevious, fragments, bufferEnd, end) {
-    var config = this.hls.config;
-    var foundFrag = void 0;
-    var maxFragLookUpTolerance = config.maxFragLookUpTolerance;
-    var fragNext = fragPrevious ? fragments[fragPrevious.sn - fragments[0].sn + 1] : undefined;
-    var fragmentWithinToleranceTest = function fragmentWithinToleranceTest(candidate) {
-      // offset should be within fragment boundary - config.maxFragLookUpTolerance
-      // this is to cope with situations like
-      // bufferEnd = 9.991
-      // frag[Ø] : [0,10]
-      // frag[1] : [10,20]
-      // bufferEnd is within frag[0] range ... although what we are expecting is to return frag[1] here
-      //              frag start               frag start+duration
-      //                  |-----------------------------|
-      //              <--->                         <--->
-      //  ...--------><-----------------------------><---------....
-      // previous frag         matching fragment         next frag
-      //  return -1             return 0                 return 1
-      // logger.log(`level/sn/start/end/bufEnd:${level}/${candidate.sn}/${candidate.start}/${(candidate.start+candidate.duration)}/${bufferEnd}`);
-      // Set the lookup tolerance to be small enough to detect the current segment - ensures we don't skip over very small segments
-      var candidateLookupTolerance = Math.min(maxFragLookUpTolerance, candidate.duration + (candidate.deltaPTS ? candidate.deltaPTS : 0));
-      if (candidate.start + candidate.duration - candidateLookupTolerance <= bufferEnd) {
-        return 1;
-      } else if (candidate.start - candidateLookupTolerance > bufferEnd && candidate.start) {
-        // if maxFragLookUpTolerance will have negative value then don't return -1 for first element
-        return -1;
-      }
-
-      return 0;
-    };
-
-    if (bufferEnd < end) {
-      if (bufferEnd > end - maxFragLookUpTolerance) {
-        maxFragLookUpTolerance = 0;
-      }
-
-      // Prefer the next fragment if it's within tolerance
-      if (fragNext && !fragmentWithinToleranceTest(fragNext)) {
-        foundFrag = fragNext;
-      } else {
-        foundFrag = binary_search.search(fragments, fragmentWithinToleranceTest);
-      }
-    }
-    return foundFrag;
-  };
-
   StreamController.prototype._findFragment = function _findFragment(start, fragPrevious, fragLen, fragments, bufferEnd, end, levelDetails) {
     var config = this.hls.config;
+    var fragBySN = function fragBySN() {
+      return findFragmentBySN(fragPrevious, fragments, bufferEnd, end, config.maxFragLookUpTolerance);
+    };
     var frag = void 0;
     var foundFrag = void 0;
 
     if (bufferEnd < end) {
       if (!levelDetails.programDateTime) {
         // Uses buffer and sequence number to calculate switch segment (required if using EXT-X-DISCONTINUITY-SEQUENCE)
-        foundFrag = this._findFragmentBySN(fragPrevious, fragments, bufferEnd, end);
+        foundFrag = findFragmentBySN(fragPrevious, fragments, bufferEnd, end, config.maxFragLookUpTolerance);
       } else {
         // Relies on PDT in order to switch bitrates (Support EXT-X-DISCONTINUITY without EXT-X-DISCONTINUITY-SEQUENCE)
-        // compute PDT of bufferEnd: PDT(bufferEnd) = 1000*bufferEnd + PDT(start) = 1000*bufferEnd + PDT(level) - level sliding
-        foundFrag = this._findFragmentByPDT(fragments, bufferEnd * 1000 + (levelDetails.programDateTime ? Date.parse(levelDetails.programDateTime) : 0) - 1000 * start);
+        foundFrag = findFragmentByPDT(fragments, calculateNextPDT(start, bufferEnd, levelDetails));
+        if (!foundFrag || fragmentWithinToleranceTest(bufferEnd, config.maxFragLookUpTolerance, foundFrag)) {
+          // Fall back to SN order if finding by PDT returns a frag which won't fit within the stream
+          // fragmentWithToleranceTest returns 0 if the frag is within tolerance; 1 or -1 otherwise
+          logger["b" /* logger */].warn('Frag found by PDT search did not fit within tolerance; falling back to finding by SN');
+          foundFrag = fragBySN();
+        }
       }
     } else {
       // reach end of playlist
@@ -9974,6 +10046,7 @@ var stream_controller_StreamController = function (_TaskLoop) {
     var config = this.config,
         media = this.media;
 
+    var stallDebounceInterval = 1000;
     if (!media || media.readyState === 0) {
       // Exit early if we don't have media or if the media hasn't bufferd anything yet (readyState 0)
       return;
@@ -10005,13 +10078,16 @@ var stream_controller_StreamController = function (_TaskLoop) {
       } else if (expectedPlaying) {
         // The playhead isn't moving but it should be
         // Allow some slack time to for small stalls to resolve themselves
+        var stalledDuration = tnow - this.stalled;
+        var bufferInfo = BufferHelper.bufferInfo(media, currentTime, config.maxBufferHole);
         if (!this.stalled) {
           this.stalled = tnow;
           return;
+        } else if (stalledDuration >= stallDebounceInterval) {
+          // Report stalling after trying to fix
+          this._reportStall(bufferInfo.len);
         }
 
-        var bufferInfo = BufferHelper.bufferInfo(media, currentTime, config.maxBufferHole);
-        var stalledDuration = tnow - this.stalled;
         this._tryFixBufferStall(bufferInfo, stalledDuration);
       }
     }
@@ -10067,7 +10143,6 @@ var stream_controller_StreamController = function (_TaskLoop) {
     var currentTime = media.currentTime;
     var jumpThreshold = 0.5; // tolerance needed as some browsers stalls playback before reaching buffered range end
 
-    this._reportStall(bufferInfo.len);
     var partial = this.fragmentTracker.getPartialFragment(currentTime);
     if (partial) {
       // Try to skip over the buffer hole caused by a partial fragment
@@ -11949,16 +12024,21 @@ var cap_level_controller_CapLevelController = function (_EventHandler) {
   function CapLevelController(hls) {
     cap_level_controller__classCallCheck(this, CapLevelController);
 
-    return cap_level_controller__possibleConstructorReturn(this, _EventHandler.call(this, hls, events["a" /* default */].FPS_DROP_LEVEL_CAPPING, events["a" /* default */].MEDIA_ATTACHING, events["a" /* default */].MANIFEST_PARSED));
+    var _this = cap_level_controller__possibleConstructorReturn(this, _EventHandler.call(this, hls, events["a" /* default */].FPS_DROP_LEVEL_CAPPING, events["a" /* default */].MEDIA_ATTACHING, events["a" /* default */].MANIFEST_PARSED, events["a" /* default */].BUFFER_CODECS));
+
+    _this.autoLevelCapping = Number.POSITIVE_INFINITY;
+    _this.firstLevel = null;
+    _this.levels = [];
+    _this.media = null;
+    _this.restrictedLevels = [];
+    _this.timer = null;
+    return _this;
   }
 
   CapLevelController.prototype.destroy = function destroy() {
     if (this.hls.config.capLevelToPlayerSize) {
-      this.media = this.restrictedLevels = null;
-      this.autoLevelCapping = Number.POSITIVE_INFINITY;
-      if (this.timer) {
-        this.timer = clearInterval(this.timer);
-      }
+      this.media = null;
+      this._stopCapping();
     }
   };
 
@@ -11976,15 +12056,28 @@ var cap_level_controller_CapLevelController = function (_EventHandler) {
   CapLevelController.prototype.onManifestParsed = function onManifestParsed(data) {
     var hls = this.hls;
     this.restrictedLevels = [];
-    // Only fire getMaxLevel or detectPlayerSize if video is expected in the manifest
+    this.levels = data.levels;
+    this.firstLevel = data.firstLevel;
     if (hls.config.capLevelToPlayerSize && (data.video || data.levels.length && data.altAudio)) {
-      this.autoLevelCapping = Number.POSITIVE_INFINITY;
-      this.levels = data.levels;
-      hls.firstLevel = this.getMaxLevel(data.firstLevel);
-      clearInterval(this.timer);
-      this.timer = setInterval(this.detectPlayerSize.bind(this), 1000);
-      this.detectPlayerSize();
+      // Start capping immediately if the manifest has signaled video codecs
+      this._startCapping();
     }
+  };
+
+  // Only activate capping when playing a video stream; otherwise, multi-bitrate audio-only streams will be restricted
+  // to the first level
+
+
+  CapLevelController.prototype.onBufferCodecs = function onBufferCodecs(data) {
+    var hls = this.hls;
+    if (hls.config.capLevelToPlayerSize && data.video) {
+      // If the manifest did not signal a video codec capping has been deferred until we're certain video is present
+      this._startCapping();
+    }
+  };
+
+  CapLevelController.prototype.onLevelsUpdated = function onLevelsUpdated(data) {
+    this.levels = data.levels;
   };
 
   CapLevelController.prototype.detectPlayerSize = function detectPlayerSize() {
@@ -12020,6 +12113,28 @@ var cap_level_controller_CapLevelController = function (_EventHandler) {
     });
 
     return CapLevelController.getMaxLevelByMediaSize(validLevels, this.mediaWidth, this.mediaHeight);
+  };
+
+  CapLevelController.prototype._startCapping = function _startCapping() {
+    if (this.timer) {
+      // Don't reset capping if started twice; this can happen if the manifest signals a video codec
+      return;
+    }
+    this.autoLevelCapping = Number.POSITIVE_INFINITY;
+    this.hls.firstLevel = this.getMaxLevel(this.firstLevel);
+    clearInterval(this.timer);
+    this.timer = setInterval(this.detectPlayerSize.bind(this), 1000);
+    this.detectPlayerSize();
+  };
+
+  CapLevelController.prototype._stopCapping = function _stopCapping() {
+    this.restrictedLevels = [];
+    this.firstLevel = null;
+    this.autoLevelCapping = Number.POSITIVE_INFINITY;
+    if (this.timer) {
+      this.timer = clearInterval(this.timer);
+      this.timer = null;
+    }
   };
 
   CapLevelController.isLevelAllowed = function isLevelAllowed(level) {
@@ -12545,7 +12660,7 @@ var hls_Hls = function () {
      * @type {string}
      */
     get: function get() {
-      return "0.9.1-tv4-0.1";
+      return "0.9.1-tv4-0.2";
     }
   }, {
     key: 'Events',
@@ -12605,8 +12720,6 @@ var hls_Hls = function () {
   }]);
 
   function Hls() {
-    var _this = this;
-
     var config = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
 
     hls__classCallCheck(this, Hls);
@@ -12739,12 +12852,15 @@ var hls_Hls = function () {
       coreComponents.push(emeController);
     }
 
-    // optional subtitle controller
-    [config.subtitleStreamController, config.timelineController].forEach(function (Controller) {
-      if (Controller) {
-        coreComponents.push(new Controller(_this));
-      }
-    });
+    // optional subtitle controllers
+    Controller = config.subtitleStreamController;
+    if (Controller) {
+      coreComponents.push(new Controller(this, fragmentTracker));
+    }
+    Controller = config.timelineController;
+    if (Controller) {
+      coreComponents.push(new Controller(this));
+    }
 
     /**
      * @member {ICoreComponent[]}

@@ -6449,7 +6449,7 @@ var m3u8_parser_M3U8Parser = function () {
     return medias;
   };
 
-  M3U8Parser.parseLevelPlaylist = function parseLevelPlaylist(string, baseurl, id, type) {
+  M3U8Parser.parseLevelPlaylist = function parseLevelPlaylist(string, baseurl, id, type, levelUrlId) {
     var currentSN = 0,
         totalduration = 0,
         level = { type: null, version: null, url: baseurl, fragments: [], live: true, startSN: 0 },
@@ -6481,6 +6481,7 @@ var m3u8_parser_M3U8Parser = function () {
           frag.sn = sn;
           frag.level = id;
           frag.cc = cc;
+          frag.urlId = levelUrlId;
           frag.baseurl = baseurl;
           // avoid sliced strings    https://github.com/video-dev/hls.js/issues/939
           frag.relurl = (' ' + result[3]).slice(1);
@@ -7012,10 +7013,11 @@ var playlist_loader_PlaylistLoader = function (_EventHandler) {
 
     var url = PlaylistLoader.getResponseUrl(response, context);
 
-    var levelId = !isNaN(level) ? level : !isNaN(id) ? id : 0; // level -> id -> 0
+    var levelUrlId = isNaN(id) ? 0 : id;
+    var levelId = isNaN(level) ? levelUrlId : level; // level -> id -> 0
     var levelType = PlaylistLoader.mapContextToLevelType(context);
 
-    var levelDetails = m3u8_parser.parseLevelPlaylist(response.data, url, levelId, levelType);
+    var levelDetails = m3u8_parser.parseLevelPlaylist(response.data, url, levelId, levelType, levelUrlId);
 
     // set stats on level structure
     levelDetails.tload = stats.tload;
@@ -7297,24 +7299,26 @@ var fragment_loader_FragmentLoader = function (_EventHandler) {
   FragmentLoader.prototype.loaderror = function loaderror(response, context) {
     var networkDetails = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : null;
 
-    var loader = context.loader;
+    var frag = context.frag;
+    var loader = frag.loader;
     if (loader) {
       loader.abort();
     }
 
-    this.loaders[context.type] = undefined;
+    this.loaders[frag.type] = undefined;
     this.hls.trigger(events["a" /* default */].ERROR, { type: errors["b" /* ErrorTypes */].NETWORK_ERROR, details: errors["a" /* ErrorDetails */].FRAG_LOAD_ERROR, fatal: false, frag: context.frag, response: response, networkDetails: networkDetails });
   };
 
   FragmentLoader.prototype.loadtimeout = function loadtimeout(stats, context) {
     var networkDetails = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : null;
 
-    var loader = context.loader;
+    var frag = context.frag;
+    var loader = frag.loader;
     if (loader) {
       loader.abort();
     }
 
-    this.loaders[context.type] = undefined;
+    this.loaders[frag.type] = undefined;
     this.hls.trigger(events["a" /* default */].ERROR, { type: errors["b" /* ErrorTypes */].NETWORK_ERROR, details: errors["a" /* ErrorDetails */].FRAG_LOAD_TIMEOUT, fatal: false, frag: context.frag, networkDetails: networkDetails });
   };
 
@@ -7614,7 +7618,7 @@ var fragment_tracker_FragmentTracker = function (_EventHandler) {
   };
 
   FragmentTracker.prototype.getFragmentKey = function getFragmentKey(fragment) {
-    return fragment.type + '_' + fragment.level + '_' + fragment.sn;
+    return fragment.type + '_' + fragment.level + '_' + fragment.urlId + '_' + fragment.sn;
   };
 
   /**
@@ -7704,8 +7708,8 @@ var fragment_tracker_FragmentTracker = function (_EventHandler) {
 
   FragmentTracker.prototype.onFragLoaded = function onFragLoaded(e) {
     var fragment = e.frag;
-    // dont track initsegment (for which sn is not a number)
-    // dont track frags used for bitrateTest, they're irrelevant
+    // don't track initsegment (for which sn is not a number)
+    // don't track frags used for bitrateTest, they're irrelevant.
     if (!isNaN(fragment.sn) && !fragment.bitrateTest) {
       var fragKey = this.getFragmentKey(fragment);
       var fragmentEntity = {
@@ -8582,6 +8586,136 @@ var TaskLoop = function (_EventHandler) {
 }(event_handler);
 
 /* harmony default export */ var task_loop = (TaskLoop);
+// CONCATENATED MODULE: ./src/controller/fragment-finders.js
+
+
+/**
+ * Calculates the PDT of the next load position.
+ * bufferEnd in this function is usually the position of the playhead.
+ * @param {number} [start = 0] - The PTS of the first fragment within the level
+ * @param {number} [bufferEnd = 0] - The end of the contiguous buffered range the playhead is currently within
+ * @param {*} levelDetails - An object containing the parsed and computed properties of the currently playing level
+ * @returns {number} nextPdt - The computed PDT
+ */
+function calculateNextPDT() {
+  var start = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 0;
+  var bufferEnd = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
+  var levelDetails = arguments[2];
+
+  var pdt = 0;
+  if (levelDetails.programDateTime) {
+    var parsedDateInt = Date.parse(levelDetails.programDateTime);
+    if (!isNaN(parsedDateInt)) {
+      pdt = bufferEnd * 1000 + parsedDateInt - 1000 * start;
+    }
+  }
+  return pdt;
+}
+
+/**
+ * Finds the first fragment whose endPDT value exceeds the given PDT.
+ * @param {Array<Fragment>} fragments - The array of candidate fragments
+ * @param {number|null} [PDTValue = null] - The PDT value which must be exceeded
+ * @returns {*|null} fragment - The best matching fragment
+ */
+function findFragmentByPDT(fragments) {
+  var PDTValue = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : null;
+
+  if (!Array.isArray(fragments) || !fragments.length || PDTValue === null) {
+    return null;
+  }
+
+  // if less than start
+  var firstSegment = fragments[0];
+
+  if (PDTValue < firstSegment.pdt) {
+    return null;
+  }
+
+  var lastSegment = fragments[fragments.length - 1];
+
+  if (PDTValue >= lastSegment.endPdt) {
+    return null;
+  }
+
+  for (var seg = 0; seg < fragments.length; ++seg) {
+    var frag = fragments[seg];
+    if (PDTValue < frag.endPdt) {
+      return frag;
+    }
+  }
+  return null;
+}
+
+/**
+ * Finds a fragment based on the SN of the previous fragment; or based on the needs of the current buffer.
+ * This method compensates for small buffer gaps by applying a tolerance to the start of any candidate fragment, thus
+ * breaking any traps which would cause the same fragment to be continuously selected within a small range.
+ * @param {*} fragPrevious - The last frag successfully appended
+ * @param {Array<Fragment>} fragments - The array of candidate fragments
+ * @param {number} [bufferEnd = 0] - The end of the contiguous buffered range the playhead is currently within
+ * @param {number} [end = 0] - The computed end time of the stream
+ * @param {number} maxFragLookUpTolerance - The amount of time that a fragment's start can be within in order to be considered contiguous
+ * @returns {*} foundFrag - The best matching fragment
+ */
+function findFragmentBySN(fragPrevious, fragments) {
+  var bufferEnd = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 0;
+  var end = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : 0;
+  var maxFragLookUpTolerance = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : 0;
+
+  var foundFrag = void 0;
+  var fragNext = fragPrevious ? fragments[fragPrevious.sn - fragments[0].sn + 1] : null;
+  if (bufferEnd < end) {
+    if (bufferEnd > end - maxFragLookUpTolerance) {
+      maxFragLookUpTolerance = 0;
+    }
+
+    // Prefer the next fragment if it's within tolerance
+    if (fragNext && !fragment_finders_fragmentWithinToleranceTest(bufferEnd, maxFragLookUpTolerance, fragNext)) {
+      foundFrag = fragNext;
+    } else {
+      foundFrag = binary_search.search(fragments, fragment_finders_fragmentWithinToleranceTest.bind(null, bufferEnd, maxFragLookUpTolerance));
+    }
+  }
+  return foundFrag;
+}
+
+/**
+ * The test function used by the findFragmentBySn's BinarySearch to look for the best match to the current buffer conditions.
+ * @param {*} candidate - The fragment to test
+ * @param {number} [bufferEnd = 0] - The end of the current buffered range the playhead is currently within
+ * @param {number} [maxFragLookUpTolerance = 0] - The amount of time that a fragment's start can be within in order to be considered contiguous
+ * @returns {number} - 0 if it matches, 1 if too low, -1 if too high
+ */
+function fragment_finders_fragmentWithinToleranceTest() {
+  var bufferEnd = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 0;
+  var maxFragLookUpTolerance = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
+  var candidate = arguments[2];
+
+  // offset should be within fragment boundary - config.maxFragLookUpTolerance
+  // this is to cope with situations like
+  // bufferEnd = 9.991
+  // frag[Ø] : [0,10]
+  // frag[1] : [10,20]
+  // bufferEnd is within frag[0] range ... although what we are expecting is to return frag[1] here
+  //              frag start               frag start+duration
+  //                  |-----------------------------|
+  //              <--->                         <--->
+  //  ...--------><-----------------------------><---------....
+  // previous frag         matching fragment         next frag
+  //  return -1             return 0                 return 1
+  // logger.log(`level/sn/start/end/bufEnd:${level}/${candidate.sn}/${candidate.start}/${(candidate.start+candidate.duration)}/${bufferEnd}`);
+  // Set the lookup tolerance to be small enough to detect the current segment - ensures we don't skip over very small segments
+  var candidateLookupTolerance = Math.min(maxFragLookUpTolerance, candidate.duration + (candidate.deltaPTS ? candidate.deltaPTS : 0));
+  if (candidate.start + candidate.duration - candidateLookupTolerance <= bufferEnd) {
+    return 1;
+  } else if (candidate.start - candidateLookupTolerance > bufferEnd && candidate.start) {
+    // if maxFragLookUpTolerance will have negative value then don't return -1 for first element
+    return -1;
+  }
+
+  return 0;
+}
 // CONCATENATED MODULE: ./src/controller/stream-controller.js
 var stream_controller__createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
 
@@ -8594,6 +8728,7 @@ function stream_controller__inherits(subClass, superClass) { if (typeof superCla
 /*
  * Stream Controller
 */
+
 
 
 
@@ -8622,6 +8757,8 @@ var State = {
   ENDED: 'ENDED',
   ERROR: 'ERROR'
 };
+
+var TICK_INTERVAL = 100; // how often to tick in ms
 
 var stream_controller_StreamController = function (_TaskLoop) {
   stream_controller__inherits(StreamController, _TaskLoop);
@@ -8655,7 +8792,7 @@ var stream_controller_StreamController = function (_TaskLoop) {
       var lastCurrentTime = this.lastCurrentTime,
           hls = this.hls;
       this.stopLoad();
-      this.setInterval(100);
+      this.setInterval(TICK_INTERVAL);
       this.level = -1;
       this.fragLoadError = 0;
       if (!this.startFragRequested) {
@@ -8965,7 +9102,7 @@ var stream_controller_StreamController = function (_TaskLoop) {
           }
         } else {
           // Relies on PDT in order to switch bitrates (Support EXT-X-DISCONTINUITY without EXT-X-DISCONTINUITY-SEQUENCE)
-          frag = this._findFragmentByPDT(fragments, fragPrevious.endPdt + 1);
+          frag = findFragmentByPDT(fragments, fragPrevious.endPdt + 1);
         }
       }
       if (!frag) {
@@ -8979,92 +9116,27 @@ var stream_controller_StreamController = function (_TaskLoop) {
     return frag;
   };
 
-  StreamController.prototype._findFragmentByPDT = function _findFragmentByPDT(fragments, PDTValue) {
-    if (!fragments || PDTValue === undefined) {
-      return null;
-    }
-
-    // if less than start
-    var firstSegment = fragments[0];
-
-    if (PDTValue < firstSegment.pdt) {
-      return null;
-    }
-
-    var lastSegment = fragments[fragments.length - 1];
-
-    if (PDTValue >= lastSegment.endPdt) {
-      return null;
-    }
-
-    for (var seg = 0; seg < fragments.length; ++seg) {
-      var frag = fragments[seg];
-      if (PDTValue < frag.endPdt) {
-        return frag;
-      }
-    }
-    return null;
-  };
-
-  StreamController.prototype._findFragmentBySN = function _findFragmentBySN(fragPrevious, fragments, bufferEnd, end) {
-    var config = this.hls.config;
-    var foundFrag = void 0;
-    var maxFragLookUpTolerance = config.maxFragLookUpTolerance;
-    var fragNext = fragPrevious ? fragments[fragPrevious.sn - fragments[0].sn + 1] : undefined;
-    var fragmentWithinToleranceTest = function fragmentWithinToleranceTest(candidate) {
-      // offset should be within fragment boundary - config.maxFragLookUpTolerance
-      // this is to cope with situations like
-      // bufferEnd = 9.991
-      // frag[Ø] : [0,10]
-      // frag[1] : [10,20]
-      // bufferEnd is within frag[0] range ... although what we are expecting is to return frag[1] here
-      //              frag start               frag start+duration
-      //                  |-----------------------------|
-      //              <--->                         <--->
-      //  ...--------><-----------------------------><---------....
-      // previous frag         matching fragment         next frag
-      //  return -1             return 0                 return 1
-      // logger.log(`level/sn/start/end/bufEnd:${level}/${candidate.sn}/${candidate.start}/${(candidate.start+candidate.duration)}/${bufferEnd}`);
-      // Set the lookup tolerance to be small enough to detect the current segment - ensures we don't skip over very small segments
-      var candidateLookupTolerance = Math.min(maxFragLookUpTolerance, candidate.duration + (candidate.deltaPTS ? candidate.deltaPTS : 0));
-      if (candidate.start + candidate.duration - candidateLookupTolerance <= bufferEnd) {
-        return 1;
-      } else if (candidate.start - candidateLookupTolerance > bufferEnd && candidate.start) {
-        // if maxFragLookUpTolerance will have negative value then don't return -1 for first element
-        return -1;
-      }
-
-      return 0;
-    };
-
-    if (bufferEnd < end) {
-      if (bufferEnd > end - maxFragLookUpTolerance) {
-        maxFragLookUpTolerance = 0;
-      }
-
-      // Prefer the next fragment if it's within tolerance
-      if (fragNext && !fragmentWithinToleranceTest(fragNext)) {
-        foundFrag = fragNext;
-      } else {
-        foundFrag = binary_search.search(fragments, fragmentWithinToleranceTest);
-      }
-    }
-    return foundFrag;
-  };
-
   StreamController.prototype._findFragment = function _findFragment(start, fragPrevious, fragLen, fragments, bufferEnd, end, levelDetails) {
     var config = this.hls.config;
+    var fragBySN = function fragBySN() {
+      return findFragmentBySN(fragPrevious, fragments, bufferEnd, end, config.maxFragLookUpTolerance);
+    };
     var frag = void 0;
     var foundFrag = void 0;
 
     if (bufferEnd < end) {
       if (!levelDetails.programDateTime) {
         // Uses buffer and sequence number to calculate switch segment (required if using EXT-X-DISCONTINUITY-SEQUENCE)
-        foundFrag = this._findFragmentBySN(fragPrevious, fragments, bufferEnd, end);
+        foundFrag = findFragmentBySN(fragPrevious, fragments, bufferEnd, end, config.maxFragLookUpTolerance);
       } else {
         // Relies on PDT in order to switch bitrates (Support EXT-X-DISCONTINUITY without EXT-X-DISCONTINUITY-SEQUENCE)
-        // compute PDT of bufferEnd: PDT(bufferEnd) = 1000*bufferEnd + PDT(start) = 1000*bufferEnd + PDT(level) - level sliding
-        foundFrag = this._findFragmentByPDT(fragments, bufferEnd * 1000 + (levelDetails.programDateTime ? Date.parse(levelDetails.programDateTime) : 0) - 1000 * start);
+        foundFrag = findFragmentByPDT(fragments, calculateNextPDT(start, bufferEnd, levelDetails));
+        if (!foundFrag || fragment_finders_fragmentWithinToleranceTest(bufferEnd, config.maxFragLookUpTolerance, foundFrag)) {
+          // Fall back to SN order if finding by PDT returns a frag which won't fit within the stream
+          // fragmentWithToleranceTest returns 0 if the frag is within tolerance; 1 or -1 otherwise
+          logger["b" /* logger */].warn('Frag found by PDT search did not fit within tolerance; falling back to finding by SN');
+          foundFrag = fragBySN();
+        }
       }
     } else {
       // reach end of playlist
@@ -9984,6 +10056,7 @@ var stream_controller_StreamController = function (_TaskLoop) {
     var config = this.config,
         media = this.media;
 
+    var stallDebounceInterval = 1000;
     if (!media || media.readyState === 0) {
       // Exit early if we don't have media or if the media hasn't bufferd anything yet (readyState 0)
       return;
@@ -10015,13 +10088,16 @@ var stream_controller_StreamController = function (_TaskLoop) {
       } else if (expectedPlaying) {
         // The playhead isn't moving but it should be
         // Allow some slack time to for small stalls to resolve themselves
+        var stalledDuration = tnow - this.stalled;
+        var bufferInfo = BufferHelper.bufferInfo(media, currentTime, config.maxBufferHole);
         if (!this.stalled) {
           this.stalled = tnow;
           return;
+        } else if (stalledDuration >= stallDebounceInterval) {
+          // Report stalling after trying to fix
+          this._reportStall(bufferInfo.len);
         }
 
-        var bufferInfo = BufferHelper.bufferInfo(media, currentTime, config.maxBufferHole);
-        var stalledDuration = tnow - this.stalled;
         this._tryFixBufferStall(bufferInfo, stalledDuration);
       }
     }
@@ -10077,7 +10153,6 @@ var stream_controller_StreamController = function (_TaskLoop) {
     var currentTime = media.currentTime;
     var jumpThreshold = 0.5; // tolerance needed as some browsers stalls playback before reaching buffered range end
 
-    this._reportStall(bufferInfo.len);
     var partial = this.fragmentTracker.getPartialFragment(currentTime);
     if (partial) {
       // Try to skip over the buffer hole caused by a partial fragment
@@ -11959,16 +12034,21 @@ var cap_level_controller_CapLevelController = function (_EventHandler) {
   function CapLevelController(hls) {
     cap_level_controller__classCallCheck(this, CapLevelController);
 
-    return cap_level_controller__possibleConstructorReturn(this, _EventHandler.call(this, hls, events["a" /* default */].FPS_DROP_LEVEL_CAPPING, events["a" /* default */].MEDIA_ATTACHING, events["a" /* default */].MANIFEST_PARSED));
+    var _this = cap_level_controller__possibleConstructorReturn(this, _EventHandler.call(this, hls, events["a" /* default */].FPS_DROP_LEVEL_CAPPING, events["a" /* default */].MEDIA_ATTACHING, events["a" /* default */].MANIFEST_PARSED, events["a" /* default */].BUFFER_CODECS));
+
+    _this.autoLevelCapping = Number.POSITIVE_INFINITY;
+    _this.firstLevel = null;
+    _this.levels = [];
+    _this.media = null;
+    _this.restrictedLevels = [];
+    _this.timer = null;
+    return _this;
   }
 
   CapLevelController.prototype.destroy = function destroy() {
     if (this.hls.config.capLevelToPlayerSize) {
-      this.media = this.restrictedLevels = null;
-      this.autoLevelCapping = Number.POSITIVE_INFINITY;
-      if (this.timer) {
-        this.timer = clearInterval(this.timer);
-      }
+      this.media = null;
+      this._stopCapping();
     }
   };
 
@@ -11986,15 +12066,28 @@ var cap_level_controller_CapLevelController = function (_EventHandler) {
   CapLevelController.prototype.onManifestParsed = function onManifestParsed(data) {
     var hls = this.hls;
     this.restrictedLevels = [];
-    // Only fire getMaxLevel or detectPlayerSize if video is expected in the manifest
+    this.levels = data.levels;
+    this.firstLevel = data.firstLevel;
     if (hls.config.capLevelToPlayerSize && (data.video || data.levels.length && data.altAudio)) {
-      this.autoLevelCapping = Number.POSITIVE_INFINITY;
-      this.levels = data.levels;
-      hls.firstLevel = this.getMaxLevel(data.firstLevel);
-      clearInterval(this.timer);
-      this.timer = setInterval(this.detectPlayerSize.bind(this), 1000);
-      this.detectPlayerSize();
+      // Start capping immediately if the manifest has signaled video codecs
+      this._startCapping();
     }
+  };
+
+  // Only activate capping when playing a video stream; otherwise, multi-bitrate audio-only streams will be restricted
+  // to the first level
+
+
+  CapLevelController.prototype.onBufferCodecs = function onBufferCodecs(data) {
+    var hls = this.hls;
+    if (hls.config.capLevelToPlayerSize && data.video) {
+      // If the manifest did not signal a video codec capping has been deferred until we're certain video is present
+      this._startCapping();
+    }
+  };
+
+  CapLevelController.prototype.onLevelsUpdated = function onLevelsUpdated(data) {
+    this.levels = data.levels;
   };
 
   CapLevelController.prototype.detectPlayerSize = function detectPlayerSize() {
@@ -12030,6 +12123,28 @@ var cap_level_controller_CapLevelController = function (_EventHandler) {
     });
 
     return CapLevelController.getMaxLevelByMediaSize(validLevels, this.mediaWidth, this.mediaHeight);
+  };
+
+  CapLevelController.prototype._startCapping = function _startCapping() {
+    if (this.timer) {
+      // Don't reset capping if started twice; this can happen if the manifest signals a video codec
+      return;
+    }
+    this.autoLevelCapping = Number.POSITIVE_INFINITY;
+    this.hls.firstLevel = this.getMaxLevel(this.firstLevel);
+    clearInterval(this.timer);
+    this.timer = setInterval(this.detectPlayerSize.bind(this), 1000);
+    this.detectPlayerSize();
+  };
+
+  CapLevelController.prototype._stopCapping = function _stopCapping() {
+    this.restrictedLevels = [];
+    this.firstLevel = null;
+    this.autoLevelCapping = Number.POSITIVE_INFINITY;
+    if (this.timer) {
+      this.timer = clearInterval(this.timer);
+      this.timer = null;
+    }
   };
 
   CapLevelController.isLevelAllowed = function isLevelAllowed(level) {
@@ -12596,6 +12711,8 @@ var audio_stream_controller_State = {
   WAITING_INIT_PTS: 'WAITING_INIT_PTS'
 };
 
+var audio_stream_controller_TICK_INTERVAL = 100; // how often to tick in ms
+
 var audio_stream_controller_AudioStreamController = function (_TaskLoop) {
   audio_stream_controller__inherits(AudioStreamController, _TaskLoop);
 
@@ -12651,7 +12768,7 @@ var audio_stream_controller_AudioStreamController = function (_TaskLoop) {
     if (this.tracks) {
       var lastCurrentTime = this.lastCurrentTime;
       this.stopLoad();
-      this.setInterval(100);
+      this.setInterval(audio_stream_controller_TICK_INTERVAL);
       this.fragLoadError = 0;
       if (lastCurrentTime > 0 && startPosition === -1) {
         logger["b" /* logger */].log('audio:override startPosition with lastCurrentTime @' + lastCurrentTime.toFixed(3));
@@ -12815,6 +12932,9 @@ var audio_stream_controller_AudioStreamController = function (_TaskLoop) {
                 this.media.currentTime = nextBuffered + 0.05;
                 return;
               }
+            } else if (this.resyncWithVideoCC && this.videoTrackCC !== null) {
+              this.resyncWithVideoCC = false;
+              frag = findFragWithCC(fragments, this.videoTrackCC);
             } else {
               var foundFrag = void 0;
               var maxFragLookUpTolerance = config.maxFragLookUpTolerance;
@@ -12933,6 +13053,12 @@ var audio_stream_controller_AudioStreamController = function (_TaskLoop) {
               logger["b" /* logger */].warn('Waiting fragment CC (' + waitingFragCC + ') does not match video track CC (' + videoTrackCC + ')');
               this.waitingFragment = null;
               this.state = audio_stream_controller_State.IDLE;
+            } else if (videoTrackCC > waitingFragCC) {
+              logger["b" /* logger */].warn('Waiting fragment CC (' + waitingFragCC + ') is lower than video track CC (' + videoTrackCC + '), resyncing based on video CC');
+              this.fragmentTracker.removeFragment(this.waitingFragment.frag);
+              this.resyncWithVideoCC = true;
+              this.waitingFragment = null;
+              this.state = audio_stream_controller_State.IDLE;
             }
           } else {
             this.state = audio_stream_controller_State.FRAG_LOADING;
@@ -13024,7 +13150,7 @@ var audio_stream_controller_AudioStreamController = function (_TaskLoop) {
       }
     } else {
       // switching to audio track, start timer if not already started
-      this.setInterval(100);
+      this.setInterval(audio_stream_controller_TICK_INTERVAL);
     }
 
     // should we switch tracks ?
@@ -15998,7 +16124,7 @@ var timeline_controller_TimelineController = function (_EventHandler) {
     else if (frag.type === 'subtitle') {
         if (payload.byteLength) {
           // We need an initial synchronisation PTS. Store fragments as long as none has arrived.
-          if (this.initPTS[frag.cc] === undefined) {
+          if (!this.initPTS[frag.cc]) {
             this.unparsedVttFrags.push(data);
             if (this.initPTS.length) {
               // finish unsuccessfully, otherwise the subtitle-stream-controller could be blocked from loading new frags.
@@ -16066,7 +16192,7 @@ var timeline_controller_TimelineController = function (_EventHandler) {
         frag = data.frag;
 
     if (frag.type === 'subtitle') {
-      if (this.initPTS[frag.cc] === undefined) {
+      if (!this.initPTS[frag.cc]) {
         this.unparsedVttFrags.push(data);
         return;
       }
@@ -16159,12 +16285,12 @@ var subtitle_track_controller_SubtitleTrackController = function (_EventHandler)
 
     _this.tracks = [];
     _this.trackId = -1;
-    _this.media = undefined;
+    _this.media = null;
 
     /**
      * @member {boolean} subtitleDisplay Enable/disable subtitle display rendering
      */
-    _this.subtitleDisplay = false;
+    _this.subtitleDisplay = true;
     return _this;
   }
 
@@ -16205,7 +16331,7 @@ var subtitle_track_controller_SubtitleTrackController = function (_EventHandler)
       return;
     }
 
-    if (this.queuedDefaultTrack !== undefined) {
+    if (this.queuedDefaultTrack) {
       this.subtitleTrack = this.queuedDefaultTrack;
       delete this.queuedDefaultTrack;
     }
@@ -16233,7 +16359,7 @@ var subtitle_track_controller_SubtitleTrackController = function (_EventHandler)
       this.media.textTracks.removeEventListener('change', this.trackChangeListener);
     }
 
-    this.media = undefined;
+    this.media = null;
   };
 
   // Reset subtitle tracks on manifest loading
@@ -16284,7 +16410,7 @@ var subtitle_track_controller_SubtitleTrackController = function (_EventHandler)
 
     var details = subtitleTrack.details;
     // check if we need to load playlist for this subtitle Track
-    if (details === undefined || details.live === true) {
+    if (!details || details.live === true) {
       // track not retrieved yet, or live playlist we need to (re)load it
       logger["b" /* logger */].log('(re)loading playlist for subtitle track ' + trackId);
       this.hls.trigger(events["a" /* default */].SUBTITLE_TRACK_LOADING, { url: subtitleTrack.url, id: trackId });
@@ -16307,8 +16433,7 @@ var subtitle_track_controller_SubtitleTrackController = function (_EventHandler)
       }
       if (!data.details.live && this.timer) {
         // playlist is not live and timer is armed : stopping it
-        clearInterval(this.timer);
-        this.timer = null;
+        this._stopTimer();
       }
     }
   };
@@ -16316,44 +16441,77 @@ var subtitle_track_controller_SubtitleTrackController = function (_EventHandler)
   /** get alternate subtitle tracks list from playlist **/
 
 
+  /**
+   * This method is responsible for validating the subtitle index and periodically reloading if live.
+   * Dispatches the SUBTITLE_TRACK_SWITCH event, which instructs the subtitle-stream-controller to load the selected track.
+   * @param newId - The id of the subtitle track to activate.
+   */
   SubtitleTrackController.prototype.setSubtitleTrackInternal = function setSubtitleTrackInternal(newId) {
-    // check if level idx is valid
-    if (newId < -1 || newId >= this.tracks.length) {
+    var hls = this.hls,
+        tracks = this.tracks;
+
+    if (typeof newId !== 'number' || newId < -1 || newId >= tracks.length) {
       return;
     }
 
-    // stopping live reloading timer if any
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-
-    var textTracks = filterSubtitleTracks(this.media.textTracks);
-
-    // hide currently enabled subtitle track
-    if (this.trackId !== -1) {
-      textTracks[this.trackId].mode = 'disabled';
-    }
-
+    this._stopTimer();
     this.trackId = newId;
     logger["b" /* logger */].log('switching to subtitle track ' + newId);
-    this.hls.trigger(events["a" /* default */].SUBTITLE_TRACK_SWITCH, { id: newId });
-
+    hls.trigger(events["a" /* default */].SUBTITLE_TRACK_SWITCH, { id: newId });
     if (newId === -1) {
       return;
     }
 
-    var subtitleTrack = this.tracks[newId];
-    if (newId < textTracks.length) {
-      textTracks[newId].mode = this.subtitleDisplay ? 'showing' : 'hidden';
-    }
-
     // check if we need to load playlist for this subtitle Track
+    var subtitleTrack = tracks[newId];
     var details = subtitleTrack.details;
-    if (details === undefined || details.live === true) {
+    if (!details || details.live) {
       // track not retrieved yet, or live playlist we need to (re)load it
       logger["b" /* logger */].log('(re)loading playlist for subtitle track ' + newId);
-      this.hls.trigger(events["a" /* default */].SUBTITLE_TRACK_LOADING, { url: subtitleTrack.url, id: newId });
+      hls.trigger(events["a" /* default */].SUBTITLE_TRACK_LOADING, { url: subtitleTrack.url, id: newId });
+    }
+  };
+
+  SubtitleTrackController.prototype._stopTimer = function _stopTimer() {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  };
+
+  /**
+   * Disables the old subtitleTrack and sets current mode on the next subtitleTrack.
+   * This operates on the DOM textTracks.
+   * A value of -1 will disable all subtitle tracks.
+   * @param newId - The id of the next track to enable
+   * @private
+   */
+
+
+  SubtitleTrackController.prototype._toggleTrackModes = function _toggleTrackModes(newId) {
+    var media = this.media,
+        subtitleDisplay = this.subtitleDisplay,
+        trackId = this.trackId;
+
+    if (!media) {
+      return;
+    }
+
+    var textTracks = filterSubtitleTracks(media.textTracks);
+    if (newId === -1) {
+      [].slice.call(textTracks).forEach(function (track) {
+        track.mode = 'disabled';
+      });
+    } else {
+      var oldTrack = textTracks[trackId];
+      if (oldTrack) {
+        oldTrack.mode = 'disabled';
+      }
+    }
+
+    var nextTrack = textTracks[newId];
+    if (nextTrack) {
+      nextTrack.mode = subtitleDisplay ? 'showing' : 'hidden';
     }
   };
 
@@ -16376,6 +16534,7 @@ var subtitle_track_controller_SubtitleTrackController = function (_EventHandler)
     set: function set(subtitleTrackId) {
       if (this.trackId !== subtitleTrackId) {
         // || this.tracks[subtitleTrackId].details === undefined) {
+        this._toggleTrackModes(subtitleTrackId);
         this.setSubtitleTrackInternal(subtitleTrackId);
       }
     }
@@ -16406,6 +16565,7 @@ function subtitle_stream_controller__inherits(subClass, superClass) { if (typeof
 
 
 
+
 var subtitle_stream_controller_State = {
   STOPPED: 'STOPPED',
   IDLE: 'IDLE',
@@ -16413,14 +16573,17 @@ var subtitle_stream_controller_State = {
   FRAG_LOADING: 'FRAG_LOADING'
 };
 
+var subtitle_stream_controller_TICK_INTERVAL = 500; // how often to tick in ms
+
 var subtitle_stream_controller_SubtitleStreamController = function (_TaskLoop) {
   subtitle_stream_controller__inherits(SubtitleStreamController, _TaskLoop);
 
-  function SubtitleStreamController(hls) {
+  function SubtitleStreamController(hls, fragmentTracker) {
     subtitle_stream_controller__classCallCheck(this, SubtitleStreamController);
 
     var _this = subtitle_stream_controller__possibleConstructorReturn(this, _TaskLoop.call(this, hls, events["a" /* default */].MEDIA_ATTACHED, events["a" /* default */].MEDIA_DETACHING, events["a" /* default */].ERROR, events["a" /* default */].KEY_LOADED, events["a" /* default */].FRAG_LOADED, events["a" /* default */].SUBTITLE_TRACKS_UPDATED, events["a" /* default */].SUBTITLE_TRACK_SWITCH, events["a" /* default */].SUBTITLE_TRACK_LOADED, events["a" /* default */].SUBTITLE_FRAG_PROCESSED));
 
+    _this.fragmentTracker = fragmentTracker;
     _this.config = hls.config;
     _this.state = subtitle_stream_controller_State.STOPPED;
     _this.tracksBuffered = [];
@@ -16430,7 +16593,9 @@ var subtitle_stream_controller_SubtitleStreamController = function (_TaskLoop) {
   }
 
   SubtitleStreamController.prototype.onHandlerDestroyed = function onHandlerDestroyed() {
+    this.fragmentTracker = null;
     this.state = subtitle_stream_controller_State.STOPPED;
+    _TaskLoop.prototype.onHandlerDestroyed.call(this);
   };
 
   SubtitleStreamController.prototype.getBuffered = function getBuffered() {
@@ -16525,45 +16690,13 @@ var subtitle_stream_controller_SubtitleStreamController = function (_TaskLoop) {
         var end = fragments[fragLen - 1].start + fragments[fragLen - 1].duration;
 
         if (bufferLen < maxConfigBuffer && bufferEnd < end) {
-          var fragNext = this.fragPrevious ? fragments[this.fragPrevious.sn - fragments[0].sn + 1] : undefined;
-
-          var fragmentWithinToleranceTest = function fragmentWithinToleranceTest(candidate) {
-            // offset should be within fragment boundary - maxFragLookUpTolerance
-            // this is to cope with situations like
-            // bufferEnd = 9.991
-            // frag[Ø] : [0,10]
-            // frag[1] : [10,20]
-            // bufferEnd is within frag[0] range ... although what we are expecting is to return frag[1] here
-            //              frag start               frag start+duration
-            //                  |-----------------------------|
-            //              <--->                         <--->
-            //  ...--------><-----------------------------><---------....
-            // previous frag         matching fragment         next frag
-            //  return -1             return 0                 return 1
-            // logger.log(`level/sn/start/end/bufEnd:${level}/${candidate.sn}/${candidate.start}/${(candidate.start+candidate.duration)}/${bufferEnd}`);
-            // Set the lookup tolerance to be small enough to detect the current segment - ensures we don't skip over very small segments
-            var candidateLookupTolerance = Math.min(maxFragLookUpTolerance, candidate.duration);
-            if (candidate.start + candidate.duration - candidateLookupTolerance <= bufferEnd) {
-              return 1;
-            } else if (candidate.start - candidateLookupTolerance > bufferEnd && candidate.start) {
-              // if maxFragLookUpTolerance will have negative value then don't return -1 for first element
-              return -1;
-            }
-            return 0;
-          };
-
-          var foundFrag = void 0;
-          if (fragNext && !fragmentWithinToleranceTest(fragNext)) {
-            foundFrag = fragNext;
-          } else {
-            foundFrag = binary_search.search(fragments, fragmentWithinToleranceTest);
-          }
-
+          var foundFrag = findFragmentBySN(this.fragPrevious, fragments, bufferEnd, end, maxFragLookUpTolerance);
           if (foundFrag && foundFrag.encrypted) {
             logger["b" /* logger */].log('Loading key for ' + foundFrag.sn);
             this.state = subtitle_stream_controller_State.KEY_LOADING;
             this.hls.trigger(events["a" /* default */].KEY_LOADING, { frag: foundFrag });
-          } else if (foundFrag) {
+          } else if (foundFrag && this.fragmentTracker.getState(foundFrag) === FragmentState.NOT_LOADED) {
+            // only load if fragment is not loaded
             foundFrag.trackId = trackId; // Frags don't know their subtitle track ID, so let's just add that...
             this.fragCurrent = foundFrag;
             this.state = subtitle_stream_controller_State.FRAG_LOADING;
@@ -16589,16 +16722,15 @@ var subtitle_stream_controller_SubtitleStreamController = function (_TaskLoop) {
 
   SubtitleStreamController.prototype.onSubtitleTrackSwitch = function onSubtitleTrackSwitch(data) {
     this.currentTrackId = data.id;
-    if (this.currentTrackId === -1) {
+    if (!this.tracks || this.currentTrackId === -1) {
       this.clearInterval();
       return;
     }
 
     // Check if track has the necessary details to load fragments
     var currentTrack = this.tracks[this.currentTrackId];
-    var details = currentTrack.details;
-    if (details !== undefined) {
-      this.setInterval(500);
+    if (currentTrack && currentTrack.details) {
+      this.setInterval(subtitle_stream_controller_TICK_INTERVAL);
     }
   };
 
@@ -16606,7 +16738,7 @@ var subtitle_stream_controller_SubtitleStreamController = function (_TaskLoop) {
 
 
   SubtitleStreamController.prototype.onSubtitleTrackLoaded = function onSubtitleTrackLoaded() {
-    this.setInterval(500);
+    this.setInterval(subtitle_stream_controller_TICK_INTERVAL);
   };
 
   SubtitleStreamController.prototype.onKeyLoaded = function onKeyLoaded() {
@@ -17355,7 +17487,7 @@ var hls_Hls = function () {
      * @type {string}
      */
     get: function get() {
-      return "0.9.1-tv4-0.1";
+      return "0.9.1-tv4-0.2";
     }
   }, {
     key: 'Events',
@@ -17415,8 +17547,6 @@ var hls_Hls = function () {
   }]);
 
   function Hls() {
-    var _this = this;
-
     var config = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
 
     hls__classCallCheck(this, Hls);
@@ -17549,12 +17679,15 @@ var hls_Hls = function () {
       coreComponents.push(emeController);
     }
 
-    // optional subtitle controller
-    [config.subtitleStreamController, config.timelineController].forEach(function (Controller) {
-      if (Controller) {
-        coreComponents.push(new Controller(_this));
-      }
-    });
+    // optional subtitle controllers
+    Controller = config.subtitleStreamController;
+    if (Controller) {
+      coreComponents.push(new Controller(this, fragmentTracker));
+    }
+    Controller = config.timelineController;
+    if (Controller) {
+      coreComponents.push(new Controller(this));
+    }
 
     /**
      * @member {ICoreComponent[]}
